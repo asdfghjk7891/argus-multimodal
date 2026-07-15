@@ -134,16 +134,26 @@ class Argus_LANL(GCN):
     def __init__(self, data_load, data_kws, h_dim, z_dim, device):
         super().__init__(data_load, data_kws, h_dim, z_dim, device)
         self.data.x_dim = self.data.x_dim
+
+        # [수정] data_kws에서 use_flows 직접 읽어오기
+        self.use_flows = data_kws.get('use_flows', False)
+
         self.c1 = GCNConv(self.data.x_dim, h_dim, add_self_loops=True)
         self.relu = nn.ReLU()
         self.c2 = GCNConv(h_dim, h_dim, add_self_loops=True)
         self.drop = nn.Dropout(0.1)
         self.ac = nn.Tanh()
         self.c3 = GCNConv(h_dim, z_dim, add_self_loops=True)
-        nn4 = nn.Sequential(nn.Linear(10, 8), nn.ReLU(), # lanl: 3 or 10; optc: 5
+
+        # [수정] flows 여부에 따라 엣지 특징 차원 동적 설정
+        # flows 없음: 엣지 특징 3개 (user C, user U, user A)
+        # flows 있음: 엣지 특징 10개 (3 + 7개 flows 특징)
+        ea_dim = 10 if self.use_flows else 3
+        print(f"[Argus_LANL] use_flows={self.use_flows}, ea_dim={ea_dim}")
+
+        nn4 = nn.Sequential(nn.Linear(ea_dim, 8), nn.ReLU(),
                             nn.Linear(8, h_dim * z_dim))
         self.c4 = NNConv(h_dim, z_dim, nn4, aggr='mean')
-
 
     def forward_once(self, mask_enum, i):
         if self.data.dynamic_feats:
@@ -165,9 +175,102 @@ class Argus_LANL(GCN):
         x = self.c4(x, ei, edge_attr=ea)
         return self.ac(x)
 
+class Argus_LANL_LateFusion(GCN):
+    """
+    Late Fusion 구조:
+    - auth encoder: auth edge feature (3차원) 독립 인코딩
+    - flows encoder: flows edge feature (7차원) 독립 인코딩
+    - fusion MLP: concat 후 최종 embedding으로 압축
+    """
+    def __init__(self, data_load, data_kws, h_dim, z_dim, device):
+        super().__init__(data_load, data_kws, h_dim, z_dim, device)
+
+        self.use_flows = data_kws.get('use_flows', False)
+        print(f"[Argus_LANL_LateFusion] use_flows={self.use_flows}")
+
+        # ── Auth Encoder (3차원 edge feature) ──────────────────
+        self.c1 = GCNConv(self.data.x_dim, h_dim, add_self_loops=True)
+        self.relu = nn.ReLU()
+        self.c2 = GCNConv(h_dim, h_dim, add_self_loops=True)
+        self.drop = nn.Dropout(0.1)
+        self.c3 = GCNConv(h_dim, z_dim, add_self_loops=True)
+        self.ac = nn.Tanh()
+
+        auth_nn = nn.Sequential(
+            nn.Linear(3, 8), nn.ReLU(),
+            nn.Linear(8, h_dim * z_dim)
+        )
+        self.c4_auth = NNConv(h_dim, z_dim, auth_nn, aggr='mean')
+
+        # ── Flows Encoder (7차원 edge feature) ─────────────────
+        self.f1 = GCNConv(self.data.x_dim, h_dim, add_self_loops=True)
+        self.f2 = GCNConv(h_dim, h_dim, add_self_loops=True)
+        self.f3 = GCNConv(h_dim, z_dim, add_self_loops=True)
+
+        flows_nn = nn.Sequential(
+            nn.Linear(7, 8), nn.ReLU(),
+            nn.Linear(8, h_dim * z_dim)
+        )
+        self.c4_flows = NNConv(h_dim, z_dim, flows_nn, aggr='mean')
+
+        # ── Fusion MLP ─────────────────────────────────────────
+        self.fusion = nn.Sequential(
+            nn.Linear(z_dim * 2, z_dim),
+            nn.Tanh()
+        )
+
+    def forward_once(self, mask_enum, i):
+        if self.data.dynamic_feats:
+            x = self.data.xs[i].to(self.device)
+        else:
+            x = self.data.xs.to(self.device)
+
+        ei = self.data.ei_masked(mask_enum, i).to(self.device)
+        ea = self.data.ea_masked(mask_enum, i).to(self.device)
+        ew = self.data.ew_masked(mask_enum, i).to(self.device)
+
+        ea = torch.transpose(ea, 0, 1)  # (num_edges, 10)
+
+        # ea 분리
+        ea_auth  = ea[:, :3]   # (num_edges, 3): uc, uu, ua
+        ea_flows = ea[:, 3:]   # (num_edges, 7): flows 통계값 7개
+
+        # ── Auth Encoding ──────────────────────────────────────
+        x_auth = self.c1(x, ei, edge_weight=ew)
+        x_auth = self.c2(x_auth, ei, edge_weight=ew)
+        x_auth = self.relu(x_auth)
+        x_auth = self.drop(x_auth)
+        x_auth = self.c3(x_auth, ei, edge_weight=ew)
+        x_auth = self.relu(x_auth)
+        x_auth = self.drop(x_auth)
+        auth_emb = self.c4_auth(x_auth, ei, edge_attr=ea_auth)
+        auth_emb = self.ac(auth_emb)
+
+        # ── Flows Encoding ─────────────────────────────────────
+        x_flows = self.f1(x, ei, edge_weight=ew)
+        x_flows = self.f2(x_flows, ei, edge_weight=ew)
+        x_flows = self.relu(x_flows)
+        x_flows = self.drop(x_flows)
+        x_flows = self.f3(x_flows, ei, edge_weight=ew)
+        x_flows = self.relu(x_flows)
+        x_flows = self.drop(x_flows)
+        flows_emb = self.c4_flows(x_flows, ei, edge_attr=ea_flows)
+        flows_emb = self.ac(flows_emb)
+
+        # ── Fusion ─────────────────────────────────────────────
+        fused = torch.cat([auth_emb, flows_emb], dim=1)  # (num_nodes, z_dim*2)
+        return self.fusion(fused)                          # (num_nodes, z_dim)
+
 def detector_lanl_rref(loader, kwargs, h_dim, z_dim, **kws):
     device = kwargs.pop('device')
     return DetectorEncoder(Argus_LANL(loader, kwargs, h_dim, z_dim, device), device, 'LANL')
+
+def detector_lanl_late_rref(loader, kwargs, h_dim, z_dim, **kws):
+    device = kwargs.pop('device')
+    return DetectorEncoder(
+        Argus_LANL_LateFusion(loader, kwargs, h_dim, z_dim, device),
+        device, 'LANL'
+    )
 
 class DetectorEncoder(Euler_Embed_Unit):
     def __init__(self, module: Euler_Embed_Unit, device, dataset, **kwargs):

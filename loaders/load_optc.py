@@ -16,7 +16,7 @@ DATE_OF_EVIL_LANL = 573290 #original 573290
 FILE_DELTA = 10000
 
 # Input the path where OpTC data locates which should be the same as DST in split_optc.py
-OPTC_FOLDER = ''
+OPTC_FOLDER = 'C:/Users/user/Desktop/Argus/data/'
 assert OPTC_FOLDER, 'Please fill in the OPTC_FOLDER in loaders/load_optc.py'
 
 TIMES = {

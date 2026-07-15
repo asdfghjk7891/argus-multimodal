@@ -3,10 +3,10 @@ import pickle
 from tqdm import tqdm
 # Set dataset paths
 # =============
-RED = '' # Location of redteam.txt
-SRC = '' # Location of auth.txt
-DST = '' # Directory to save output files to
-SRC_DIR = '' # Directory of flows.txt, auth.txt
+RED = 'C:/Users/user/Desktop/Argus/data/redteam.txt' # Location of redteam.txt
+SRC = 'C:/Users/user/Desktop/Argus/data/auth.txt' # Location of auth.txt
+DST = 'C:/Users/user/Desktop/Argus/data/lanl/' # Directory to save output files to
+SRC_DIR = 'C:/Users/user/Desktop/Argus/data/' # Directory of flows.txt, auth.txt
 # =============
 
 

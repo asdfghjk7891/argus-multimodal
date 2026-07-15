@@ -2,6 +2,7 @@ import math
 import os
 import pickle
 import time
+import datetime
 import pandas as pd
 import numpy as np
 from sklearn.metrics import roc_auc_score as auc_score, f1_score, average_precision_score as ap_score, precision_recall_curve, confusion_matrix
@@ -86,8 +87,92 @@ def classification(args, rnn_args, worker_args, OUTPATH, device):
 
     # Retrieve stats, and cleanup temp file
     stats = pickle.load(open(OUTPATH+TMP_FILE, 'rb'))
+
+    # [추가] 실험 결과 자동 저장
+    save_results(stats, args, OUTPATH)
+
     return stats
 
+
+# [추가] 실험 결과를 CSV 및 TXT 파일로 자동 저장하는 함수
+def save_results(stats, args, OUTPATH):
+    # Precision 계산 추가
+    for s in stats:
+        tp = s.get('tp', 0)
+        fp = s.get('fp', 0)
+        s['Precision'] = tp / (tp + fp) if (tp + fp) > 0 else 0.0
+
+    # 저장할 항목 선택 및 순서 정리
+    columns = ['Model', 'Dataset', 'Loss', 'AP', 'AUC', 'Precision', 'TPR', 'FPR', 'F1', 'TP', 'FP', 'TN', 'FN', 'TPE', 'FwdTime', 'Timestamp']
+
+    # 데이터셋 및 Loss 정보 추가
+    dataset_name = args.dataset.split('_')[0]  # 'OPTC_ARGUS' -> 'OPTC'
+    loss_name = args.loss
+
+    rows = []
+    for s in stats:
+        row = {
+            'Model'    : s.get('Model', 'test'),
+            'Dataset'  : dataset_name,
+            'Loss'     : loss_name,
+            'AP'       : round(s.get('AP', 0), 4),
+            'AUC'      : round(s.get('AUC', 0), 4),
+            'Precision': round(s.get('Precision', 0), 4),
+            'TPR'      : round(s.get('TPR', 0), 4),
+            'FPR'      : round(s.get('FPR', 0), 4),
+            'F1'       : round(s.get('F1', 0), 4),
+            'TP'       : s.get('tp', 0),
+            'FP'       : s.get('fp', 0),
+            'TN'       : s.get('tn', 0),
+            'FN'       : s.get('fn', 0),
+            'TPE'      : round(s.get('TPE', 0), 4),
+            'FwdTime'  : round(s.get('FwdTime', 0), 4),
+            'Timestamp': datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+        }
+        rows.append(row)
+
+    df = pd.DataFrame(rows, columns=columns)
+
+    # 1. CSV 저장 (OUTPATH 내부)
+    csv_path = os.path.join(OUTPATH, 'result.csv')
+    df.to_csv(csv_path, index=False, encoding='utf-8-sig')
+    print(f"\n[결과 저장 완료] CSV: {csv_path}")
+
+    # 2. TXT 저장 (OUTPATH 내부)
+    txt_path = os.path.join(OUTPATH, 'result.txt')
+    with open(txt_path, 'w', encoding='utf-8') as f:
+        f.write("=" * 60 + "\n")
+        f.write("ARGUS 실험 결과\n")
+        f.write("=" * 60 + "\n")
+        f.write(f"데이터셋  : {dataset_name}\n")
+        f.write(f"Loss 함수 : {loss_name}\n")
+        f.write(f"실험 시각 : {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+        f.write("-" * 60 + "\n")
+        for row in rows:
+            f.write(f"AP        : {row['AP']}\n")
+            f.write(f"AUC       : {row['AUC']}\n")
+            f.write(f"Precision : {row['Precision']}\n")
+            f.write(f"Recall    : {row['TPR']}\n")
+            f.write(f"FPR       : {row['FPR']}\n")
+            f.write(f"F1        : {row['F1']}\n")
+            f.write(f"TP        : {row['TP']}\n")
+            f.write(f"FP        : {row['FP']}\n")
+            f.write(f"TN        : {row['TN']}\n")
+            f.write(f"FN        : {row['FN']}\n")
+            f.write(f"FwdTime   : {row['FwdTime']}s\n")
+        f.write("=" * 60 + "\n")
+    print(f"[결과 저장 완료] TXT: {txt_path}")
+
+    # 3. 누적 CSV 저장 (Exps/ 폴더에 전체 실험 기록 누적)
+    cumulative_path = './Exps/all_results.csv'
+    if os.path.exists(cumulative_path):
+        existing_df = pd.read_csv(cumulative_path, encoding='utf-8-sig')
+        combined_df = pd.concat([existing_df, df], ignore_index=True)
+    else:
+        combined_df = df
+    combined_df.to_csv(cumulative_path, index=False, encoding='utf-8-sig')
+    print(f"[결과 저장 완료] 누적 CSV: {cumulative_path}")
+    print(f"\n{'=' * 60}")
 
 
 def train(rrefs, args, rnn_args, device):
@@ -230,7 +315,6 @@ def score_stats(args, scores, labels, weights, cutoff, ctime):
     print("tn, fp, fn, tp: ", tn, fp, fn, tp)
     scores = 1-scores
 
-
     # Get metrics
     auc = auc_score(labels, scores)
     ap = ap_score(labels, scores)
@@ -241,7 +325,7 @@ def score_stats(args, scores, labels, weights, cutoff, ctime):
     print("TP: %d  FP: %d" % (tp, fp))
     print("F1: %0.8f" % f1)
     print("AUC: %0.4f  AP: %0.4f\n" % (auc,ap))
-    print("FwdTime", ctime, )
+    print("FwdTime", ctime)
     title = "test"
     return {
         'Model': title,
@@ -258,5 +342,3 @@ def score_stats(args, scores, labels, weights, cutoff, ctime):
         'fn': fn,
         'tp': tp
     }
-
-
