@@ -86,7 +86,7 @@ DST = 'C:/Users/user/Desktop/Argus/data/lanl/'        # 전처리 결과 저장 
 SRC_DIR = 'C:/Users/user/Desktop/Argus/data/'         # flows.txt가 있는 폴더
 ```
 
-전처리 실행 (시간이 오래 걸릴 수 있습니다):
+전처리 실행 :
 ```bash
 cd C:\Users\user\Desktop\Argus
 conda activate argus
