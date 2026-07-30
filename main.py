@@ -5,7 +5,7 @@ import torch
 import loaders.load_optc as optc
 import loaders.load_lanl as lanl
 from models.recurrent import GRU, LSTM, EmptyModel
-from models.argus import detector_lanl_rref, detector_optc_rref, detector_lanl_late_rref
+from models.argus import detector_lanl_rref, detector_optc_rref, detector_lanl_late_rref, detector_lanl_uniflows_rref
 from classification import classification
 
 # Reproducibility
@@ -42,7 +42,7 @@ def args():
     # [수정] store_false → store_true: --flows 입력 시 flows 사용, 없으면 미사용
     ap.add_argument('--flows', action='store_true')
     ap.add_argument('--fusion', type=str, default='early',
-                choices=['early', 'late'],
+                choices=['early', 'late', 'uniflows'],
                 help='멀티모달 융합 방식 선택: early (기본값) 또는 late')
     ap.add_argument('--loss', type=str, default="default", choices=['default', 'ap', 'bce'])
     # [추가] 랜덤 시드를 명령어 옵션으로 지정 가능하도록 추가
@@ -104,6 +104,9 @@ def args():
         if args.flows and args.fusion == 'late':
             args.encoder = detector_lanl_late_rref
             print("[융합 방식] Late Fusion 사용")
+        elif args.flows and args.fusion == 'uniflows':
+            args.encoder = detector_lanl_uniflows_rref
+            print("[융합 방식] Uni-Flows 사용 (flows만 단독)")
         else:
             args.encoder = detector_lanl_rref
             print("[융합 방식] Early Fusion 사용")

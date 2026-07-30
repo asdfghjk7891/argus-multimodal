@@ -272,6 +272,64 @@ def detector_lanl_late_rref(loader, kwargs, h_dim, z_dim, **kws):
         device, 'LANL'
     )
 
+class Argus_LANL_UniFlows(GCN):
+    """
+    Uni-Flows 구조:
+    - flows edge feature (7차원)만 독립적으로 인코딩
+    - auth feature 미사용
+    - 멀티모달 필요성 입증을 위한 단일모달 베이스라인
+    """
+    def __init__(self, data_load, data_kws, h_dim, z_dim, device):
+        super().__init__(data_load, data_kws, h_dim, z_dim, device)
+        print(f"[Argus_LANL_UniFlows] flows feature만 사용 (7차원)")
+
+        self.c1 = GCNConv(self.data.x_dim, h_dim, add_self_loops=True)
+        self.relu = nn.ReLU()
+        self.c2 = GCNConv(h_dim, h_dim, add_self_loops=True)
+        self.drop = nn.Dropout(0.1)
+        self.c3 = GCNConv(h_dim, z_dim, add_self_loops=True)
+        self.ac = nn.Tanh()
+
+        # flows feature 7차원만 처리하는 NNConv
+        flows_nn = nn.Sequential(
+            nn.Linear(7, 8), nn.ReLU(),
+            nn.Linear(8, h_dim * z_dim)
+        )
+        self.c4 = NNConv(h_dim, z_dim, flows_nn, aggr='mean')
+
+    def forward_once(self, mask_enum, i):
+        if self.data.dynamic_feats:
+            x = self.data.xs[i].to(self.device)
+        else:
+            x = self.data.xs.to(self.device)
+
+        ei = self.data.ei_masked(mask_enum, i).to(self.device)
+        ea = self.data.ea_masked(mask_enum, i).to(self.device)
+        ew = self.data.ew_masked(mask_enum, i).to(self.device)
+
+        ea = torch.transpose(ea, 0, 1)  # (num_edges, 10)
+
+        # flows feature만 추출 (뒤 7개)
+        ea_flows = ea[:, 3:]  # (num_edges, 7)
+
+        x = self.c1(x, ei, edge_weight=ew)
+        x = self.c2(x, ei, edge_weight=ew)
+        x = self.relu(x)
+        x = self.drop(x)
+        x = self.c3(x, ei, edge_weight=ew)
+        x = self.relu(x)
+        x = self.drop(x)
+        x = self.c4(x, ei, edge_attr=ea_flows)
+        return self.ac(x)
+
+
+def detector_lanl_uniflows_rref(loader, kwargs, h_dim, z_dim, **kws):
+    device = kwargs.pop('device')
+    return DetectorEncoder(
+        Argus_LANL_UniFlows(loader, kwargs, h_dim, z_dim, device),
+        device, 'LANL'
+    )
+
 class DetectorEncoder(Euler_Embed_Unit):
     def __init__(self, module: Euler_Embed_Unit, device, dataset, **kwargs):
         super().__init__(**kwargs)
