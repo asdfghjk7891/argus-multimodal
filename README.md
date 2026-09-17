@@ -1,7 +1,9 @@
-# ARGUS Multimodal Extension
+# MAGNET: Multi-modal Attack-aware Graph NETwork
 **정보통신공학과 202302916 이용비**
 
 기존 ARGUS (Xu et al., IEEE S&P 2024)의 미완성된 멀티모달 구조를 완성하고 발전시키는 졸업논문 연구입니다.
+
+> **MAGNET** (**M**ulti-modal **A**ttack-aware **G**raph **NET**work): 인증 로그와 네트워크 플로우를 Late Fusion으로 결합하여 동적 그래프 기반 비지도 내부자 위협 탐지 성능을 향상시키는 프레임워크
 
 ---
 
@@ -10,6 +12,12 @@
 - **Base Paper**: ARGUS: Understanding and Bridging the Gap Between Unsupervised Network Representation Learning and Security Analytics (IEEE S&P 2024)
 - **Original Repository**: https://github.com/C0ldstudy/Argus
 - **연구 목표**: 기존 ARGUS의 미완성된 멀티모달 구조(auth 로그 + 네트워크 플로우)를 완성하고, Early Fusion의 불안정성을 Late Fusion 구조로 개선
+- **핵심 기여**:
+  1. ARGUS Late Fusion 구조 완성 (LANL 데이터셋 AP +80.7%)
+  2. OpTC bro 네트워크 센서 전처리 파이프라인 구현 및 타임스탬프 동기화 문제(8,028초) 해결
+  3. H1(flows 커버리지), H2(훈련/테스트 연속성), H3(데이터 이종성) 가설 검증 실험
+  4. 멀티모달 이상 탐지를 위한 **데이터셋 적합성 요건 6가지** 도출
+  5. PicoDomain 데이터셋에서 요건 6/6 충족 시 멀티모달 TP +94% 추가 검증
 
 ---
 
@@ -22,7 +30,7 @@
 - Python: 3.9
 
 ### 1단계: Anaconda 설치
-https://www.anaconda.com/download 에서 설치 후 Anaconda Prompt를 통해 실행하였습니다. 
+https://www.anaconda.com/download 에서 설치 후 Anaconda Prompt를 통해 실행하였습니다.
 
 ### 2단계: 가상환경 생성 및 활성화
 ```bash
@@ -58,59 +66,52 @@ python -c "import torch; print(torch.__version__); print(torch.cuda.is_available
 
 ## 데이터셋 준비
 
-### LANL 데이터셋 다운로드
-1. https://csr.lanl.gov/data/cyber1/ 접속
-2. 아래 3개 파일 다운로드 (신청 후 승인 필요)
-   - `auth.txt.gz` (인증 로그, 약 73GB)
-   - `flows.txt.gz` (네트워크 플로우, 약 5.2GB)
-   - `redteam.txt.gz` (공격 레이블)
+### LANL 데이터셋
+1. https://csr.lanl.gov/data/cyber1/ 접속 (신청 후 승인 필요)
+2. `auth.txt.gz`, `flows.txt.gz`, `redteam.txt.gz` 다운로드
 3. 압축 해제 후 아래 경로에 저장
 
 ```
-C:/Users/user/Desktop/Argus/data/
-├── auth.txt        ← 압축 해제한 파일
-├── flows.txt       ← 압축 해제한 파일
-└── redteam.txt     ← 압축 해제한 파일
+data/
+├── auth.txt
+├── flows.txt
+└── redteam.txt
 ```
 
-> **주의**: auth.txt는 용량이 매우 크므로 (73GB) 충분한 저장 공간이 필요합니다.
-
-### 데이터 전처리
-`loaders/split_lanl.py` 상단의 경로를 본인 환경에 맞게 수정합니다.
-
-```python
-# loaders/split_lanl.py 상단 경로 설정 부분
-RED = 'C:/Users/user/Desktop/Argus/data/redteam.txt'  # redteam.txt 경로
-SRC = 'C:/Users/user/Desktop/Argus/data/auth.txt'     # auth.txt 경로
-DST = 'C:/Users/user/Desktop/Argus/data/lanl/'        # 전처리 결과 저장 폴더
-SRC_DIR = 'C:/Users/user/Desktop/Argus/data/'         # flows.txt가 있는 폴더
-```
-
-전처리 실행 :
+전처리 실행:
 ```bash
-cd C:\Users\user\Desktop\Argus
-conda activate argus
 python loaders/split_lanl.py
 ```
 
-전처리 완료 후 `data/lanl/` 폴더 구조:
+### OpTC 데이터셋
+1. DARPA OpTC Dataset 다운로드
+2. ecar-bro 및 bro conn 파일 준비
+
+전처리 실행:
+```bash
+python loaders/split_optc_bro.py
 ```
-data/lanl/
-├── flows/          ← flows 전처리 결과 (txt 파일 다수)
-│   ├── 0.txt
-│   ├── 10000.txt
-│   └── ...
-├── nmap.pkl        ← 노드 매핑
-├── umap.pkl        ← 유저 매핑
-├── pomap.pkl       ← 포트 매핑
-├── prmap.pkl       ← 프로토콜 매핑
-├── aomap.pkl       ← 인증 방향 매핑
-├── atmap.pkl       ← 인증 타입 매핑
-├── ltmap.pkl       ← 로그온 타입 매핑
-├── smap.pkl        ← 성공/실패 매핑
-├── 0.txt           ← auth 전처리 결과 (txt 파일 다수)
-├── 10000.txt
-└── ...
+
+> **주의**: OpTC는 타임스탬프 오프셋 8,028초 보정이 전처리 코드에 포함되어 있습니다.
+
+### CERT r6.2 데이터셋
+1. https://kilthub.cmu.edu/articles/dataset/Insider_Threat_Test_Dataset/12841247 접속
+2. `r6.2.tar.bz2`, `answers.tar.bz2` 다운로드 및 압축 해제
+
+전처리 실행:
+```bash
+python loaders/split_cert.py
+```
+
+> **주의**: http.csv가 약 90GB로 전처리에 2시간 이상 소요됩니다.
+
+### PicoDomain 데이터셋
+1. https://github.com/iHeartGraph/PicoDomain 에서 `Zeek_Logs.7z` 다운로드
+2. `Red Log.xlsx` 다운로드
+
+전처리 실행:
+```bash
+python loaders/split_picodomain.py
 ```
 
 ---
@@ -123,162 +124,172 @@ conda activate argus
 cd C:\Users\user\Desktop\Argus
 ```
 
-### 단일모달 실험 (auth 로그만 사용)
+### LANL 데이터셋
+
 ```bash
+# 단일모달
 python main.py --dataset LANL --delta 1 --lr 0.01 --loss bce --gpu --seed 0 --data_path C:\Users\user\Desktop\Argus\data\lanl\
-```
 
-### Early Fusion 멀티모달 실험 (auth + flows)
-```bash
-python main.py --dataset LANL --delta 1 --lr 0.01 --loss bce --gpu --seed 0 --data_path C:\Users\user\Desktop\Argus\data\lanl\ --flows
-```
-
-### Late Fusion 멀티모달 실험 (본 연구 개선 방식)
-```bash
+# Late Fusion 멀티모달 (MAGNET)
 python main.py --dataset LANL --delta 1 --lr 0.01 --loss bce --gpu --seed 0 --data_path C:\Users\user\Desktop\Argus\data\lanl\ --flows --fusion late
+
+# Early Fusion
+python main.py --dataset LANL --delta 1 --lr 0.01 --loss bce --gpu --seed 0 --data_path C:\Users\user\Desktop\Argus\data\lanl\ --flows --fusion early
+
+# Uni-Flows (flows만 단독)
+python main.py --dataset LANL --delta 1 --lr 0.01 --loss bce --gpu --seed 0 --data_path C:\Users\user\Desktop\Argus\data\lanl\ --flows --fusion uniflows
+```
+
+### OpTC 데이터셋
+
+```bash
+# 단일모달
+python main.py --dataset OPTC --delta 1 --lr 0.01 --loss bce --gpu --seed 0
+
+# Late Fusion 멀티모달
+python main.py --dataset OPTC --delta 1 --lr 0.01 --loss bce --gpu --seed 0 --flows --fusion late
+```
+
+### CERT r6.2 데이터셋
+
+```bash
+# 단일모달
+python main.py --dataset CERT --delta 1 --lr 0.01 --loss bce --gpu --seed 0 --data_path C:\Users\user\Desktop\Argus\data\
+
+# Late Fusion 멀티모달
+python main.py --dataset CERT --delta 1 --lr 0.01 --loss bce --gpu --seed 0 --data_path C:\Users\user\Desktop\Argus\data\ --flows --fusion late
+```
+
+### PicoDomain 데이터셋
+
+```bash
+# 단일모달
+python main.py --dataset PICO --delta 1 --lr 0.01 --loss bce --gpu --seed 0 --data_path C:\Users\user\Desktop\Argus\data\
+
+# Late Fusion 멀티모달
+python main.py --dataset PICO --delta 1 --lr 0.01 --loss bce --gpu --seed 0 --data_path C:\Users\user\Desktop\Argus\data\ --flows --fusion late
 ```
 
 ### 주요 옵션 설명
 
 | 옵션 | 기본값 | 설명 |
 |------|--------|------|
-| `--dataset` | `LANL` | 데이터셋 선택 (`LANL` 또는 `OPTC`) |
+| `--dataset` | `LANL` | 데이터셋 선택 (`LANL`, `OPTC`, `CERT`, `PICO`) |
 | `--data_path` | `None` | 데이터셋 경로 직접 지정 |
-| `--delta` | `1` | 스냅샷 크기 (시간 단위, 1 = 1시간) |
+| `--delta` | `1` | 스냅샷 크기 (시간 단위) |
 | `--lr` | `0.01` | 학습률 |
 | `--loss` | `default` | 손실 함수 (`default`, `ap`, `bce`) |
-| `--gpu` | `False` | GPU 사용 여부 (플래그) |
+| `--gpu` | `False` | GPU 사용 여부 |
 | `--seed` | `0` | 랜덤 시드 |
-| `--flows` | `False` | flows 데이터 사용 여부 (플래그) |
-| `--fusion` | `early` | 멀티모달 융합 방식 (`early` 또는 `late`) |
+| `--flows` | `False` | flows 데이터 사용 여부 |
+| `--fusion` | `early` | 멀티모달 융합 방식 (`early`, `late`, `uniflows`) |
 
 ### 실험 결과 저장 위치
 ```
 Exps/
 ├── result/
 │   └── 날짜시간_seed번호/
-│       ├── result.txt   ← 개별 실험 결과
+│       ├── result.txt
 │       └── result.csv
-└── all_results.csv      ← 전체 실험 누적 결과
+└── all_results.csv
+```
+
+---
+
+## 프레임워크 구조
+
+```
+인증 로그 (auth)  → GCN + NNConv(3차원) → auth_emb  ──┐
+                                                         ├→ MLP Fusion → GRU → Anomaly Score
+네트워크 플로우   → GCN + NNConv(7차원) → flows_emb ──┘
+(flows)
+```
+
+**Late Fusion 수식:**
+```
+z_fused = tanh(W_f · [z_auth || z_flows] + b_f)
 ```
 
 ---
 
 ## 기존 ARGUS 대비 변경사항
 
-### 1. `main.py`
+### `main.py`
+- `--flows` 옵션 버그 수정 (`store_false` → `store_true`)
+- `--data_path` 옵션 추가 (Windows 백슬래시 자동 변환)
+- `--seed` 옵션 추가 + `set_seed()` 함수
+- `--fusion` 옵션 추가 (`early`, `late`, `uniflows`)
+- `CERT`, `PICO` 데이터셋 옵션 추가
 
-#### ① `--flows` 옵션 버그 수정
-기존 코드에서 `--flows` 옵션이 `store_false`로 설정되어 있어 flows 데이터가 실질적으로 항상 비활성화되어 있었습니다.
+### `models/argus.py`
+- `Argus_LANL_LateFusion`: Late Fusion 구조 구현
+- `Argus_LANL_UniFlows`: Uni-Flows(flows 단독) 구조
+- `Argus_OPTC_LateFusion`: OpTC Late Fusion
+- `Argus_OPTC_EarlyFusion`: OpTC Early Fusion
+- `Argus_CERT`: CERT 멀티모달 구조
+- `Argus_PicoDomain_LateFusion`: PicoDomain Late Fusion 구조
 
-```python
-# 기존 (버그)
-ap.add_argument('--flows', action='store_false')
+### `classification.py`
+- `save_results()` 함수 추가 (자동 결과 저장)
 
-# 수정 후
-ap.add_argument('--flows', action='store_true')
-```
-
-#### ② `--data_path` 옵션 추가
-데이터셋 경로를 명령어 옵션으로 지정할 수 있도록 추가했습니다. Windows 백슬래시 자동 변환을 포함합니다.
-
-```python
-ap.add_argument('--data_path', type=str, default=None)
-
-if args.data_path is not None:
-    args.data_path = args.data_path.replace('\\', '/')
-    if not args.data_path.endswith('/'):
-        args.data_path += '/'
-```
-
-#### ③ `--seed` 옵션 추가 + `set_seed()` 함수 분리
-재현성 확보를 위해 랜덤 시드를 명령어 옵션으로 지정할 수 있도록 추가했습니다.
-
-```python
-def set_seed(seed):
-    random.seed(seed)
-    np.random.seed(seed)
-    torch.manual_seed(seed)
-    torch.cuda.manual_seed_all(seed)
-    torch.backends.cudnn.deterministic = True
-    torch.backends.cudnn.benchmark = False
-
-ap.add_argument('--seed', type=int, default=0)
-```
-
-#### ④ `--fusion` 옵션 추가
-멀티모달 융합 방식(Early Fusion / Late Fusion)을 선택할 수 있도록 추가했습니다.
-
-```python
-ap.add_argument('--fusion', type=str, default='early', choices=['early', 'late'])
-```
+### 신규 파일
+| 파일 | 설명 |
+|------|------|
+| `loaders/split_optc_bro.py` | OpTC bro 전처리 (타임스탬프 보정 포함) |
+| `loaders/load_optc_bro.py` | OpTC bro 로더 |
+| `loaders/split_cert.py` | CERT r6.2 전처리 |
+| `loaders/load_cert.py` | CERT r6.2 로더 |
+| `loaders/split_picodomain.py` | PicoDomain 전처리 |
+| `loaders/load_picodomain.py` | PicoDomain 로더 |
 
 ---
 
-### 2. `classification.py`
+## 실험 결과
 
-#### `save_results()` 함수 추가
-실험 결과를 자동으로 저장하는 함수를 추가했습니다.
-- 개별 실험 결과: `Exps/result/날짜시간_seed번호/result.txt`, `result.csv`
-- 누적 실험 결과: `Exps/all_results.csv`
+### 데이터셋 적합성 요건 체크리스트
 
----
+멀티모달 이상 탐지가 효과적으로 작동하기 위한 6가지 요건:
 
-### 3. `models/argus.py`
+| # | 요건 | LANL | OpTC | CERT | PicoDomain |
+|---|------|:----:|:----:|:----:|:----:|
+| ① | flows 커버리지 ≥70% | ✅ | ❌ | ✅ | ✅ |
+| ② | 훈련/테스트 연속성 | ✅ | ❌ | ✅ | ✅ |
+| ③ | 진정한 데이터 이종성 | ✅ | ⚠️ | ⚠️ | ✅ |
+| ④ | 공격이 그래프 엣지에 반영 | ✅ | ⚠️ | ❌ | ✅ |
+| ⑤ | 노드 매핑 일관성 | ✅ | ⚠️ | ✅ | ✅ |
+| ⑥ | 타임스탬프 동기화 | ✅ | ⚠️ | ✅ | ✅ |
+| | **충족 수** | **6/6** | **2/6** | **4/6** | **6/6** |
 
-#### ① `Argus_LANL`: `ea_dim` 동적 설정
-flows 사용 여부에 따라 NNConv 입력 차원을 동적으로 설정합니다.
+### LANL 데이터셋 (seed=0~4 평균)
 
-```python
-self.use_flows = data_kws.get('use_flows', False)
-ea_dim = 10 if self.use_flows else 3  # flows 없음: 3개 / flows 있음: 10개
-nn4 = nn.Sequential(nn.Linear(ea_dim, 8), nn.ReLU(), nn.Linear(8, h_dim * z_dim))
-```
+| 방식 | 평균 AP | 평균 Recall | 유효 seed | ΔAP |
+|:----:|:----:|:----:|:----:|:----:|
+| 단일모달 (ARGUS) | 0.1397 | 0.6034 | 4/5 | — |
+| Uni-Flows | 0.1961 | 0.8050 | 5/5 | +40.4% |
+| Early Fusion | 0.2101 | 0.7198 | 3/5 | +50.4% |
+| **Late Fusion (MAGNET)** | **0.2525** | **0.8287** | **5/5** | **+80.7%** |
+| ARGUS 논문 보고값 | 0.3227 | — | — | — |
 
-#### ② `Argus_LANL_LateFusion` 클래스 추가
-Early Fusion의 불안정성을 개선하기 위해 Late Fusion 구조를 새로 구현했습니다.
+### 가설 검증 실험 (LANL 기준)
 
-**Early Fusion (기존):**
-```
-auth feature (3개) ──┐
-                     ├→ NNConv → embedding → GRU → decoder
-flows feature (7개) ─┘
-```
+| 가설 | 실험 조건 | 결과 | 판정 |
+|------|------|:----:|:----:|
+| H1: flows 커버리지 부족 | flows 30% 절삭 | AP 0.3693→0.3694 | 기각 |
+| H2: 훈련/테스트 불연속 | 500,000초 gap | AP 0.3693→0.4372 | 기각 |
+| H3: 데이터 이종성 부족 | auth 통계로 flows 대체 | AP 0.2525→0.2495 (-1.2%) | 기각 |
 
-**Late Fusion (개선):**
-```
-auth 그래프  → GCN + NNConv(3차원) → auth_emb  ──┐
-                                                    ├→ MLP fusion → GRU → decoder
-flows 그래프 → GCN + NNConv(7차원) → flows_emb ──┘
-```
+→ LANL에서 Late Fusion 효과는 다양한 조건 변화에 **강건(robust)**함 확인
 
----
+### 전체 데이터셋 비교
 
-## 실험 결과 요약 (LANL, BCE Loss, seed=0~4)
+| 데이터셋 | 요건 충족 | 단일모달 AP | 멀티모달 AP | ΔAP | ΔTP |
+|------|:----:|:----:|:----:|:----:|:----:|
+| LANL | 6/6 | 0.1397 | **0.2525** | **+80.7%** ✅ | — |
+| PicoDomain | 6/6 | 0.4561 | **0.4582** | +0.5% | **+94%** ✅ |
+| CERT r6.2 | 4/6 | 0.0011 | 0.0008 | -27% ❌ | — |
+| OpTC | 2/6 | 0.2950 | 0.2807 | -4.9% ❌ | — |
 
-### 단일모달 vs Early Fusion vs Late Fusion 평균 비교
-
-| 방식 | 평균 AP | 평균 Recall | 평균 TP | 평균 FP | 평균 FN | 유효 seed |
-|:----:|:----:|:----:|:----:|:----:|:----:|:----:|
-| 단일모달 | 0.1397 | 0.6034 | 240.6 | 3,469.4 | 198.4 | 4/5 |
-| Early Fusion | 0.2101 | 0.7198 | 312.0 | 3,184.2 | 123.8 | 3/5 |
-| **Late Fusion** | **0.2525** | **0.8287** | **362.6** | **3,123.4** | **73.4** | **5/5** |
-
-### seed별 AP 비교
-
-| seed | 단일모달 | Early Fusion | Late Fusion |
-|:----:|:----:|:----:|:----:|
-| 0 | 0.0976 | 0.2323 | **0.3693** |
-| 1 | 0.1519 | 0.1401 | **0.1713** |
-| 2 | 0.2434 | 0.2389 | **0.2502** |
-| 3 | 0.0602 | 0.1242 | **0.3343** |
-| 4 | 0.1452 | **0.3148** | 0.1376 |
-
-### 주요 성과
-- Late Fusion이 단일모달 대비 평균 AP **+80.7%** 향상
-- Late Fusion이 Early Fusion 대비 평균 AP **+20.2%** 향상
-- Late Fusion은 모든 seed에서 Recall **0.77 이상** 안정적 유지
-- Late Fusion seed=0에서 ARGUS 논문 원본 결과(AP 0.3227) 초과 달성 (AP **0.3693**)
+**핵심 발견**: 요건 6/6 충족 데이터셋(LANL, PicoDomain)에서만 멀티모달 효과 확인
 
 ---
 
@@ -290,3 +301,10 @@ flows 그래프 → GCN + NNConv(7차원) → flows_emb ──┘
 - conda 환경명: argus
 
 ---
+
+## 참고문헌
+- Xu, Z., et al. (2024). ARGUS: Understanding and Bridging the Gap Between Unsupervised Network Representation Learning and Security Analytics. *IEEE S&P 2024*.
+- Kent, A. (2015). Comprehensive, multi-source cyber-security events. *Los Alamos National Laboratory*.
+- DARPA. (2020). OpTC: Operationally Transparent Cyber Dataset.
+- Glasser, J., & Lindauer, B. (2013). Bridging the gap: A pragmatic approach to generating insider threat data. *IEEE S&P Workshops 2013*.
+- iHeartGraph. (2020). PicoDomain. https://github.com/iHeartGraph/PicoDomain
