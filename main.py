@@ -3,9 +3,12 @@ import os, datetime
 import pandas as pd
 import torch
 import loaders.load_optc as optc
+import loaders.load_optc_bro as optc_bro
 import loaders.load_lanl as lanl
+import loaders.load_cert as cert
+import loaders.load_picodomain as pico
 from models.recurrent import GRU, LSTM, EmptyModel
-from models.argus import detector_lanl_rref, detector_optc_rref, detector_lanl_late_rref, detector_lanl_uniflows_rref
+from models.argus import detector_lanl_rref, detector_optc_rref, detector_lanl_late_rref, detector_lanl_uniflows_rref, detector_optc_late_rref, detector_optc_earlyfusion_rref, detector_cert_rref, detector_pico_late_rref
 from classification import classification
 
 # Reproducibility
@@ -34,7 +37,7 @@ def args():
     ap.add_argument('-te', '--te_end', choices=['20', '100', '500', 'all', 'test'], type=str.lower, default="test")
     ap.add_argument('--fpweight', type=float, default=0.6)
     # For future new data sets
-    ap.add_argument('--dataset', default='LANL', type=str.upper, choices=['OPTC', 'LANL'])
+    ap.add_argument('--dataset', default='LANL', type=str.upper, choices=['OPTC', 'LANL', 'CERT', 'PICO'])
     ap.add_argument('--lr', default=0.01, type=float)
     ap.add_argument('--patience', default=3, type=int)
     ap.add_argument('--nratio', default=1, type=int)
@@ -74,30 +77,59 @@ def args():
 
     # Parse dataset info
     if args.dataset.startswith('O'):
-        # [추가] data_path가 지정된 경우 load_optc의 폴더 경로를 동적으로 변경
         if args.data_path is not None:
             optc.OPTC_FOLDER = args.data_path
         args.loader = optc.load_optc_dist
         args.tr_start = 0
         args.tr_end = optc.DATE_OF_EVIL_LANL
-        args.val_times = None # Computed later
-        #make the test end as an input param
+        args.val_times = None
         args.te_times = [(args.tr_end, optc.TIMES[args.te_end])]
         args.delta = int(args.delta * (60**2))
     elif args.dataset.startswith('L'):
-        # [추가] data_path가 지정된 경우 load_lanl의 폴더 경로를 동적으로 변경
         if args.data_path is not None:
             lanl.LANL_FOLDER = args.data_path
         args.loader = lanl.load_lanl_dist
         args.tr_start = 0
         args.tr_end = lanl.DATE_OF_EVIL_LANL
-        args.val_times = None # Computed later
-        #make the test end as an input param
-        args.te_times = [(args.tr_end, lanl.TIMES[args.te_end])]
-        # args.delta = 1
+        args.val_times = None
+        LANL_GAP = 0
+        args.te_times = [(args.tr_end + LANL_GAP, lanl.TIMES[args.te_end])]
         args.delta = int(args.delta * (60**2))
+    elif args.dataset.startswith('C'):
+        if args.data_path is not None:
+            cert.CERT_FOLDER = args.data_path + 'cert/'
+        # meta.pkl에서 실제 DATE_OF_EVIL 로드
+        meta = cert.load_meta()
+        if meta:
+            cert.DATE_OF_EVIL_CERT = meta['DATE_OF_EVIL']
+            cert.TIMES['test'] = meta['total_duration']
+        args.loader = cert.load_cert_dist
+        args.tr_start = 0
+        args.tr_end = cert.DATE_OF_EVIL_CERT
+        args.val_times = None
+        args.te_times = [(args.tr_end, cert.TIMES['test'])]
+        args.delta = int(args.delta * 86400)  # 1일 단위
+    elif args.dataset.startswith('P'):
+        if args.data_path is not None:
+            pico.PICO_FOLDER = args.data_path + 'picodomain/'
+        meta = pico.load_meta()
+        if meta:
+            pico.DATE_OF_EVIL_PICO = meta['DATE_OF_EVIL']
+            pico.TIMES['test'] = meta['total_duration']
+        args.loader = pico.load_pico_dist
+        args.tr_start = 0
+        args.tr_end = pico.DATE_OF_EVIL_PICO
+        _delta = int(args.delta * 3600)
+        # Validation: 슬라이스 경계에 맞춘 마지막 2슬라이스
+        # DATE_OF_EVIL(65280) 직전 슬라이스 경계: 64800 (18h)
+        val_end   = (pico.DATE_OF_EVIL_PICO // _delta) * _delta  # 64800
+        val_start = val_end - _delta * 2                          # 57600
+        args.val_times = (val_start, val_end)
+        args.tr_end    = val_start   # 훈련은 val_start까지
+        args.te_times  = [(pico.DATE_OF_EVIL_PICO, pico.TIMES['test'])]
+        args.delta     = _delta
     else:
-        raise NotImplementedError('Only OpTC and LANL data sets are supported.')
+        raise NotImplementedError('Only OpTC, LANL, CERT, PICO data sets are supported.')
 
     # Convert from str to function pointer
     if (args.encoder_name == 'ARGUS') and (args.dataset.startswith('L')):
@@ -111,10 +143,29 @@ def args():
             args.encoder = detector_lanl_rref
             print("[융합 방식] Early Fusion 사용")
     elif (args.encoder_name == 'ARGUS') and (args.dataset.startswith('O')):
-        args.encoder = detector_optc_rref
+        if args.flows and args.fusion == 'late':
+            args.encoder = detector_optc_late_rref
+            print("[융합 방식] OpTC Late Fusion 사용")
+        elif args.flows and args.fusion == 'early':
+            args.encoder = detector_optc_earlyfusion_rref
+            print("[융합 방식] OpTC Early Fusion 사용")
+        else:
+            args.encoder = detector_optc_rref
+            print("[융합 방식] OpTC 단일모달 사용")
+    elif (args.encoder_name == 'ARGUS') and (args.dataset.startswith('C')):
+        args.encoder = detector_cert_rref
+        if args.flows:
+            print("[융합 방식] CERT Late Fusion 사용")
+        else:
+            print("[융합 방식] CERT 단일모달 사용")
+    elif (args.encoder_name == 'ARGUS') and (args.dataset.startswith('P')):
+        args.encoder = detector_pico_late_rref
+        if args.flows:
+            print("[융합 방식] PicoDomain Late Fusion 사용")
+        else:
+            print("[융합 방식] PicoDomain 단일모달 사용")
     else:
         raise NotImplementedError("wrong encoder", args.encoder_name, args.dataset)
-
     if args.rnn == 'GRU':
         args.rnn = GRU
     elif args.rnn == 'LSTM':

@@ -14,23 +14,26 @@ import random
 import numpy as np
 
 DATE_OF_EVIL_LANL = 150885
+FLOWS_COVERAGE = 1  # E1 실험: 1.0=100%, 0.7=70%, 0.5=50%, 0.3=30%
+USE_AUTH_STATS = True  # H3 실험: True로 설정하면 flows 대신 auth 통계 사용
 FILE_DELTA = 10000
 
 # Input the path where LANL data locates which should be the same as DST in split_lanl.py
 LANL_FOLDER = 'C:/Users/user/Desktop/Argus/data/lanl/'
 assert LANL_FOLDER, 'Please fill in the LANL_FOLDER in ./loaders/load_lanl.py'
 
-
 TIMES = {
     '5': 155399,
     '10'      : 210294,
-    '20'      : 228642, # First 20 anoms 1.55%
-    '30'      : 464254, #killed on poisoning attack
+    '20'      : 228642,
+    '30'      : 464254,
     '40'      : 485925,
-    '100'     : 740104, # First 100 anoms 11.7%
-    '500'     : 1089597, # First 500 anoms 18.73%
-    'all'  : 5011199,  # Full
-    'test' : 1270000
+    '100'     : 740104,
+    '500'     : 1089597,
+    'all'  : 5011199,
+    'test' : 1270000,
+    'gap7d' : 1270000,   # 테스트 시작: 훈련 끝 + 7일
+    'gap14d': 1270000,   # 테스트 시작: 훈련 끝 + 14일
 }
 
 def empty_lanl(use_flows=False):
@@ -133,7 +136,7 @@ def make_data_obj(cur_slice, eis, ys, ew_fn, ea_fn, ews=None, eas=None, use_flow
     return TData(cur_slice, eis_t, x, ys, masks, ews=ews, eas=eas, use_flows=use_flows, cnt=cnt, node_map=nm)
 
 
-def load_flows(fname, start, end):
+def load_flows(fname, start, end, coverage=1.0):
     eas_flows = {}
     temp_flows = {}
     if not os.path.exists(fname):
@@ -141,7 +144,6 @@ def load_flows(fname, start, end):
     in_f = open(fname)
     line = in_f.readline()
 
-    #Line in parsed flows. ts, src, dst,src_port,dst_port,proto, duration, pck_cnt, byte_cnt, label
     fmt_line = lambda x : (int(x[0]), int(x[1]), int(x[2]), int(x[6]), int(x[7]), int(x[8]))
 
     while line:
@@ -152,6 +154,10 @@ def load_flows(fname, start, end):
             continue
         if ts > end:
             break
+        # E1: coverage 비율로 무작위 샘플링
+        if random.random() > coverage:
+            line = in_f.readline()
+            continue
         ts, src, dst, duration, pck_cnt, byte_cnt = fmt_line(l)
         et = (src,dst)
         if et in temp_flows:
@@ -167,6 +173,28 @@ def load_flows(fname, start, end):
         eas_flows[et] = [len(temp_flows[et][0]), np.mean(temp_flows[et][0]), np.std(temp_flows[et][0]), \
         np.mean(temp_flows[et][1]), np.std(temp_flows[et][1]), np.mean(temp_flows[et][2]), np.std(temp_flows[et][2])]
     return eas_flows
+
+def load_auth_stats(edges_t_snapshot):
+    """
+    H3 실험: auth 이벤트에서 추출한 통계를 flows 자리에 사용
+    edges_t_snapshot: {(src,dst): [label, count, uc, uu, ua]} 형태
+    반환: {(src,dst): [7개 통계]} flows와 동일한 차원
+    """
+    auth_stats = {}
+    for et, val in edges_t_snapshot.items():
+        label, count, uc, uu, ua = val
+        total = max(count, 1)
+        # flows 7개 자리를 auth 통계로 대체
+        auth_stats[et] = [
+            float(count),           # num_events (flows의 num_flows 대체)
+            float(uc) / total,      # C타입 user 비율 (mean_duration 대체)
+            float(uu) / total,      # U타입 user 비율 (std_duration 대체)
+            float(ua) / total,      # Anonymous user 비율 (mean_pkt_cnt 대체)
+            float(uc + uu) / total, # 일반 user 비율 (std_pkt_cnt 대체)
+            float(count) / max(total, 1),  # 정규화 이벤트 수 (mean_byte_cnt 대체)
+            0.0,                    # 패딩 (std_byte_cnt 대체)
+        ]
+    return auth_stats
 
 def load_partial_lanl(start=140000, end=156659, delta=8640, is_test=False, use_flows=False, ew_fn=standardized, ea_fn=std_edge_a):
     print('start:' + str(start) + ', end:' + str(end))
@@ -227,7 +255,7 @@ def load_partial_lanl(start=140000, end=156659, delta=8640, is_test=False, use_f
         if not os.path.exists(LANL_FOLDER + '/flows'):
             print('flows has not been parsed')
         else:
-            eas_flows = load_flows(LANL_FOLDER + '/flows/' + start_f, start, end)
+            eas_flows = load_flows(LANL_FOLDER + '/flows/' + start_f, start, end, coverage=FLOWS_COVERAGE)
 
     while keep_reading:
         while line:
@@ -262,21 +290,25 @@ def load_partial_lanl(start=140000, end=156659, delta=8640, is_test=False, use_f
                     ews.append(torch.tensor(ew))
 
                     if use_flows:
-                        #get number of features from eas_flows
-                        #eas_flows_dim = len(eas_flows[next(iter(eas_flows))])
                         eas_flows_dim = 7
-                        #num_flows,mean_duration,std_duration,mean_pkt_cnt,std_pkt_cnt,mean_byte_cnt,std_byte_cnt
                         fs = {}
 
-                        for eij in edges_t.keys():
-                            if eij in eas_flows:
-                                fs[eij] = eas_flows[eij]
-                            else:
-                                fs[eij] = [0] * eas_flows_dim
+                        if USE_AUTH_STATS:
+                            # H3 실험: flows 대신 auth 통계 사용 (동종 소스)
+                            auth_fs = load_auth_stats(edges_t)
+                            for eij in edges_t.keys():
+                                fs[eij] = auth_fs.get(eij, [0] * eas_flows_dim)
+                        else:
+                            # 정상 실험: 실제 flows 데이터 사용 (이종 소스)
+                            for eij in edges_t.keys():
+                                if eij in eas_flows:
+                                    fs[eij] = eas_flows[eij]
+                                else:
+                                    fs[eij] = [0] * eas_flows_dim
 
-                        #print('Match keys' + str(edges_t.keys() == fs.keys()))
                         num_flows,mean_duration,std_duration,mean_pkt_cnt,std_pkt_cnt,mean_byte_cnt,std_byte_cnt = list(zip(*fs.values()))
                         eas.append(torch.tensor([uc,uu,ua,num_flows,mean_duration,std_duration,mean_pkt_cnt,std_pkt_cnt,mean_byte_cnt,std_byte_cnt]))
+
                     else:
                         eas.append(torch.tensor([uc,uu,ua]))
 
@@ -314,7 +346,7 @@ def load_partial_lanl(start=140000, end=156659, delta=8640, is_test=False, use_f
             in_f = open(LANL_FOLDER + str(cur_slice) + '.txt', 'r')
             line = in_f.readline()
             if use_flows:
-                eas_flows = load_flows(LANL_FOLDER + '/flows/' + str(cur_slice) + '.txt', start, end)
+                eas_flows = load_flows(LANL_FOLDER + '/flows/' + str(cur_slice) + '.txt', start, end, coverage=FLOWS_COVERAGE)
         else:
             keep_reading=False
             break
