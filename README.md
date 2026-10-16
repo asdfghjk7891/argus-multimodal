@@ -5,13 +5,18 @@
 
 인천대학교 정보통신공학과 졸업논문 코드 (202302916 이용비)
 
+```mermaid
+flowchart LR
+    A["인증 특징 (3차원)"] --> AE["Auth Encoder<br/>EW 층(GCN) x3 + EF 층(NNConv)"]
+    G["인증 그래프"] --> AE
+    G --> FE
+    F["플로우 특징 (7차원)"] --> FE["Flows Encoder<br/>EW 층(GCN) x3 + EF 층(NNConv)"]
+    AE -->|z_auth| C["결합 층<br/>연결 → 선형 → tanh"]
+    FE -->|z_flows| C
+    C --> R[GRU] --> D[내적 디코더] --> S[이상 점수]
 ```
-인증 특징 (3차원)  -> Auth Encoder  (GCN x3 + NNConv) -> z_auth  --+
-                                                                  +-> 결합 층 -> GRU -> 내적 디코더 -> 이상 점수
-플로우 특징 (7차원) -> Flows Encoder (GCN x3 + NNConv) -> z_flows --+
 
-z_fused = tanh(W_f · [z_auth || z_flows] + b_f)
-```
+두 인코더는 같은 인증 그래프와 엣지 가중치를 입력받고, 마지막 EF 층에 들어가는 엣지 특징만 다르다.
 
 ## 구조
 
@@ -52,22 +57,30 @@ pip install -r requirements.txt
 
 모든 명령은 저장소 최상위 폴더에서 실행한다. 전처리 결과는 `./data/` 아래에 저장되며, 원본 위치가 다르면 각 `split_*.py` 상단의 경로를 바꾼다.
 
-**LANL** — https://csr.lanl.gov/data/cyber1/ 에서 `auth.txt`, `flows.txt`, `redteam.txt`를 받아 `data/`에 둔다.
+### LANL
+
+https://csr.lanl.gov/data/cyber1/ 에서 `auth.txt`, `flows.txt`, `redteam.txt`를 받아 `data/`에 둔다.
 ```
 python loaders/split_lanl.py
 ```
 
-**OpTC** — ARGUS가 배포한 OpTC 전처리 데이터(`data/*.txt`, `data/nmap.pkl`, `data/redteam_optc.txt`)와 DARPA OpTC의 ecar-bro, bro conn 로그가 필요하다. ecar-bro와 ARGUS 데이터 사이의 시간 오프셋(8,028초) 보정이 포함되어 있다.
+### OpTC
+
+[ARGUS 저장소](https://github.com/C0ldstudy/Argus)의 OpTC 전처리 데이터를 `data/`에 두고, DARPA OpTC의 ecar-bro 로그(`data/ecar-bro/`)와 bro conn 로그(`data/bro/`)를 받는다. ecar-bro와 ARGUS 데이터 사이의 시간 오프셋(8,028초) 보정이 전처리에 포함되어 있다.
 ```
 python loaders/split_optc_bro.py
 ```
 
-**CERT r6.2** — https://kilthub.cmu.edu/articles/dataset/Insider_Threat_Test_Dataset/12841247 에서 `r6.2`, `answers`를 받는다. http.csv가 커서 전처리에 2시간 이상 걸린다.
+### CERT r6.2
+
+https://kilthub.cmu.edu/articles/dataset/Insider_Threat_Test_Dataset/12841247 에서 `r6.2`, `answers`를 받는다. http.csv가 커서 전처리에 2시간 이상 걸린다.
 ```
 python loaders/split_cert.py
 ```
 
-**PicoDomain** — https://github.com/iHeartGraph/PicoDomain 에서 `Zeek_Logs`, `Red Log.xlsx`를 받는다.
+### PicoDomain
+
+https://github.com/iHeartGraph/PicoDomain 에서 `Zeek_Logs`, `Red Log.xlsx`를 받는다.
 ```
 python loaders/split_picodomain.py
 ```
