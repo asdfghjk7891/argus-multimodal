@@ -1,0 +1,828 @@
+from copy import deepcopy
+import torch
+from torch import nn
+from libauc.losses import APLoss
+from torch_geometric.nn import GCNConv, NNConv
+
+
+class Euler_Embed_Unit(nn.Module):
+    def inner_forward(self, mask_enum):
+        raise NotImplementedError
+
+    def forward(self, mask_enum, no_grad):
+        if no_grad:
+            self.eval()
+            with torch.no_grad():
+                return self.inner_forward(mask_enum)
+        return self.inner_forward(mask_enum)
+
+    def decode(self, src, dst, z):
+        return torch.sigmoid(
+            (z[src] * z[dst]).sum(dim=1)
+        )
+
+
+class GCN(Euler_Embed_Unit):
+    def __init__(self, data_load, data_kws, h_dim, z_dim, device):
+        super(GCN, self).__init__()
+        self.device = device
+        self.data = data_load(**data_kws).to(self.device)
+        self.c1 = GCNConv(self.data.x_dim, h_dim, add_self_loops=True)
+        self.relu = nn.ReLU()
+        self.c2 = GCNConv(h_dim, z_dim, add_self_loops=True)
+        self.drop = nn.Dropout(0.25)
+        self.tanh = nn.Tanh()
+        self.de = DropEdge(0.5)
+
+    def inner_forward(self, mask_enum):
+        zs = []
+        for i in range(self.data.T):
+            zs.append(self.forward_once(mask_enum, i))
+        return torch.stack(zs)
+
+    def forward_once(self, mask_enum, i):
+        if self.data.dynamic_feats:
+            x = self.data.xs[i].to(self.device)
+        else:
+            x = self.data.xs.to(self.device)
+
+        ei = self.data.ei_masked(mask_enum, i).to(self.device)
+        ew = self.data.ew_masked(mask_enum, i).to(self.device)
+
+        x = self.c1(x, ei, edge_weight=ew)
+        x = self.relu(x)
+        x = self.drop(x)
+        x = self.c2(x, ei, edge_weight=ew)
+
+        # Experiments have shown this is the best activation for GCN+GRU
+        return self.tanh(x)
+
+
+# ---------------------------------------------------------------- OpTC
+
+class Argus_OPTC(GCN):
+    def __init__(self, data_load, data_kws, h_dim, z_dim, device):
+        super().__init__(data_load, data_kws, h_dim, z_dim, device)
+        self.de = DropEdge(0.5)
+        self.c1 = GCNConv(self.data.x_dim, h_dim, add_self_loops=True)
+        self.c2 = GCNConv(h_dim, h_dim, add_self_loops=True)
+        self.relu = nn.ReLU()
+        self.drop = nn.Dropout(0.1)
+        self.c3 = GCNConv(h_dim, z_dim, add_self_loops=True)
+        self.c4 = GCNConv(h_dim, z_dim, add_self_loops=True)
+        self.ac = nn.Tanh()
+
+    def forward_once(self, mask_enum, i):
+        if self.data.dynamic_feats:
+            x = self.data.xs[i].to(self.device)
+        else:
+            x = self.data.xs.to(self.device)
+        ei = self.data.ei_masked(mask_enum, i).to(self.device)
+        ew = self.data.ew_masked(mask_enum, i).to(self.device)
+        ei, ew = self.de(ei, ewa=ew)
+        x = self.c1(x, ei, edge_weight=ew)
+        x = self.c2(x, ei, edge_weight=ew)
+        x = self.relu(x)
+        x = self.drop(x)
+        x = self.c3(x, ei, edge_weight=ew)
+        x = self.relu(x)
+        x = self.drop(x)
+        x = self.c4(x, ei, edge_weight=ew)
+        return self.ac(x)
+
+
+def detector_optc_rref(loader, kwargs, h_dim, z_dim, **kws):
+    device = kwargs.pop('device')
+    return DetectorEncoder(Argus_OPTC(loader, kwargs, h_dim, z_dim, device), device, 'OPTC')
+
+
+# OpTC Late Fusion. Auth Encoder는 Argus_OPTC와 같은 구조
+class Argus_OPTC_LateFusion(GCN):
+    def __init__(self, data_load, data_kws, h_dim, z_dim, device):
+        super().__init__(data_load, data_kws, h_dim, z_dim, device)
+
+        # Auth Encoder
+        self.de = DropEdge(0.5)
+        self.c1 = GCNConv(self.data.x_dim, h_dim, add_self_loops=True)
+        self.c2 = GCNConv(h_dim, h_dim, add_self_loops=True)
+        self.relu = nn.ReLU()
+        self.drop = nn.Dropout(0.1)
+        self.c3 = GCNConv(h_dim, z_dim, add_self_loops=True)
+        self.c4 = GCNConv(h_dim, z_dim, add_self_loops=True)
+        self.ac = nn.Tanh()
+
+        # Flows Encoder
+        self.f1 = GCNConv(self.data.x_dim, h_dim, add_self_loops=True)
+        self.f2 = GCNConv(h_dim, h_dim, add_self_loops=True)
+        self.f3 = GCNConv(h_dim, z_dim, add_self_loops=True)
+        self.f4 = GCNConv(h_dim, z_dim, add_self_loops=True)
+
+        flows_nn = nn.Sequential(
+            nn.Linear(7, 8), nn.ReLU(),
+            nn.Linear(8, h_dim * z_dim)
+        )
+        self.c4_flows = NNConv(h_dim, z_dim, flows_nn, aggr='mean')
+
+        # 결합 층
+        self.fusion = nn.Sequential(
+            nn.Linear(z_dim * 2, z_dim),
+            nn.Tanh()
+        )
+
+    def forward_once(self, mask_enum, i):
+        if self.data.dynamic_feats:
+            x = self.data.xs[i].to(self.device)
+        else:
+            x = self.data.xs.to(self.device)
+
+        ei = self.data.ei_masked(mask_enum, i).to(self.device)
+        ew = self.data.ew_masked(mask_enum, i).to(self.device)
+
+        # Auth Encoder
+        ei_d, ew_d = self.de(ei, ewa=ew)
+        x_auth = self.c1(x, ei_d, edge_weight=ew_d)
+        x_auth = self.c2(x_auth, ei_d, edge_weight=ew_d)
+        x_auth = self.relu(x_auth)
+        x_auth = self.drop(x_auth)
+        x_auth = self.c3(x_auth, ei_d, edge_weight=ew_d)
+        x_auth = self.relu(x_auth)
+        x_auth = self.drop(x_auth)
+        auth_emb = self.c4(x_auth, ei_d, edge_weight=ew_d)
+        auth_emb = self.ac(auth_emb)
+
+        # Flows Encoder. 플로우가 없는 스냅샷은 0 임베딩
+        ea = self.data.ea_masked(mask_enum, i)
+        if ea is None:
+            flows_emb = torch.zeros_like(auth_emb)
+            fused = torch.cat([auth_emb, flows_emb], dim=1)
+            return self.fusion(fused)
+
+        ea = ea.to(self.device)
+        ea = torch.transpose(ea, 0, 1).float()
+
+        # 마스크된 엣지 수와 특징 수가 다르면 마스크 없는 특징으로 맞춤
+        if ea.size(0) != ei.size(1):
+            ea_full = self.data.eas[i]
+            if ea_full is not None:
+                ea_full = ea_full.to(self.device)
+                ea_full = torch.transpose(ea_full, 0, 1).float()
+                if ea_full.size(0) == ei.size(1):
+                    ea = ea_full
+                else:
+                    flows_emb = torch.zeros_like(auth_emb)
+                    fused = torch.cat([auth_emb, flows_emb], dim=1)
+                    return self.fusion(fused)
+            else:
+                flows_emb = torch.zeros_like(auth_emb)
+                fused = torch.cat([auth_emb, flows_emb], dim=1)
+                return self.fusion(fused)
+
+        x_flows = self.f1(x, ei, edge_weight=ew)
+        x_flows = self.f2(x_flows, ei, edge_weight=ew)
+        x_flows = self.relu(x_flows)
+        x_flows = self.drop(x_flows)
+        x_flows = self.f3(x_flows, ei, edge_weight=ew)
+        x_flows = self.relu(x_flows)
+        x_flows = self.drop(x_flows)
+        flows_emb = self.c4_flows(x_flows, ei, edge_attr=ea)
+        flows_emb = self.ac(flows_emb)
+
+        fused = torch.cat([auth_emb, flows_emb], dim=1)
+        return self.fusion(fused)
+
+
+# OpTC Early Fusion. Argus_OPTC 뒤에 플로우 특징 NNConv 추가
+class Argus_OPTC_EarlyFusion(Argus_OPTC):
+    def __init__(self, data_load, data_kws, h_dim, z_dim, device):
+        super().__init__(data_load, data_kws, h_dim, z_dim, device)
+
+        flows_nn = nn.Sequential(
+            nn.Linear(7, 8), nn.ReLU(),
+            nn.Linear(8, h_dim * z_dim)
+        )
+        self.c5_flows = NNConv(h_dim, z_dim, flows_nn, aggr='mean')
+
+    def forward_once(self, mask_enum, i):
+        if self.data.dynamic_feats:
+            x = self.data.xs[i].to(self.device)
+        else:
+            x = self.data.xs.to(self.device)
+
+        ei = self.data.ei_masked(mask_enum, i).to(self.device)
+        ew = self.data.ew_masked(mask_enum, i).to(self.device)
+        ei, ew = self.de(ei, ewa=ew)
+
+        x = self.c1(x, ei, edge_weight=ew)
+        x = self.c2(x, ei, edge_weight=ew)
+        x = self.relu(x)
+        x = self.drop(x)
+        x = self.c3(x, ei, edge_weight=ew)
+        x = self.relu(x)
+        x = self.drop(x)
+        x = self.c4(x, ei, edge_weight=ew)
+
+        ea = self.data.ea_masked(mask_enum, i)
+        if ea is not None:
+            ea = ea.to(self.device)
+            ea = torch.transpose(ea, 0, 1).float()
+            if ea.size(0) == ei.size(1):
+                x = self.c5_flows(x, ei, edge_attr=ea)
+
+        return self.ac(x)
+
+
+def detector_optc_earlyfusion_rref(loader, kwargs, h_dim, z_dim, **kws):
+    device = kwargs.pop('device')
+    return DetectorEncoder(
+        Argus_OPTC_EarlyFusion(loader, kwargs, h_dim, z_dim, device),
+        device, 'OPTC'
+    )
+
+
+def detector_optc_late_rref(loader, kwargs, h_dim, z_dim, **kws):
+    device = kwargs.pop('device')
+    return DetectorEncoder(
+        Argus_OPTC_LateFusion(loader, kwargs, h_dim, z_dim, device),
+        device, 'OPTC'
+    )
+
+
+# ---------------------------------------------------------------- LANL
+
+# Uni-Auth(flows 미사용)와 Early Fusion(flows 사용)
+class Argus_LANL(GCN):
+    def __init__(self, data_load, data_kws, h_dim, z_dim, device):
+        super().__init__(data_load, data_kws, h_dim, z_dim, device)
+        self.data.x_dim = self.data.x_dim
+        self.use_flows = data_kws.get('use_flows', False)
+
+        self.c1 = GCNConv(self.data.x_dim, h_dim, add_self_loops=True)
+        self.relu = nn.ReLU()
+        self.c2 = GCNConv(h_dim, h_dim, add_self_loops=True)
+        self.drop = nn.Dropout(0.1)
+        self.ac = nn.Tanh()
+        self.c3 = GCNConv(h_dim, z_dim, add_self_loops=True)
+
+        # 인증 3차원. Early Fusion이면 인증 3 + 플로우 7 = 10차원
+        ea_dim = 10 if self.use_flows else 3
+        nn4 = nn.Sequential(nn.Linear(ea_dim, 8), nn.ReLU(),
+                            nn.Linear(8, h_dim * z_dim))
+        self.c4 = NNConv(h_dim, z_dim, nn4, aggr='mean')
+
+    def forward_once(self, mask_enum, i):
+        if self.data.dynamic_feats:
+            x = self.data.xs[i].to(self.device)
+        else:
+            x = self.data.xs.to(self.device)
+
+        ei = self.data.ei_masked(mask_enum, i).to(self.device)
+        ea = self.data.ea_masked(mask_enum, i).to(self.device)
+        ew = self.data.ew_masked(mask_enum, i).to(self.device)
+        ea = torch.transpose(ea, 0, 1)
+        x1 = self.c1(x, ei, edge_weight=ew)
+        x = self.c2(x1, ei, edge_weight=ew)
+        x = self.relu(x)
+        x = self.drop(x)
+        x = self.c3(x, ei, edge_weight=ew)
+        x = self.relu(x)
+        x = self.drop(x)
+        x = self.c4(x, ei, edge_attr=ea)
+        return self.ac(x)
+
+
+# MAGNET (Late Fusion). Auth Encoder와 Flows Encoder의 임베딩을 결합
+class Argus_LANL_LateFusion(GCN):
+    def __init__(self, data_load, data_kws, h_dim, z_dim, device):
+        super().__init__(data_load, data_kws, h_dim, z_dim, device)
+        self.use_flows = data_kws.get('use_flows', False)
+
+        # Auth Encoder
+        self.c1 = GCNConv(self.data.x_dim, h_dim, add_self_loops=True)
+        self.relu = nn.ReLU()
+        self.c2 = GCNConv(h_dim, h_dim, add_self_loops=True)
+        self.drop = nn.Dropout(0.1)
+        self.c3 = GCNConv(h_dim, z_dim, add_self_loops=True)
+        self.ac = nn.Tanh()
+
+        auth_nn = nn.Sequential(
+            nn.Linear(3, 8), nn.ReLU(),
+            nn.Linear(8, h_dim * z_dim)
+        )
+        self.c4_auth = NNConv(h_dim, z_dim, auth_nn, aggr='mean')
+
+        # Flows Encoder
+        self.f1 = GCNConv(self.data.x_dim, h_dim, add_self_loops=True)
+        self.f2 = GCNConv(h_dim, h_dim, add_self_loops=True)
+        self.f3 = GCNConv(h_dim, z_dim, add_self_loops=True)
+
+        flows_nn = nn.Sequential(
+            nn.Linear(7, 8), nn.ReLU(),
+            nn.Linear(8, h_dim * z_dim)
+        )
+        self.c4_flows = NNConv(h_dim, z_dim, flows_nn, aggr='mean')
+
+        # 결합 층: 연결 -> 선형 -> tanh
+        self.fusion = nn.Sequential(
+            nn.Linear(z_dim * 2, z_dim),
+            nn.Tanh()
+        )
+
+    def forward_once(self, mask_enum, i):
+        if self.data.dynamic_feats:
+            x = self.data.xs[i].to(self.device)
+        else:
+            x = self.data.xs.to(self.device)
+
+        ei = self.data.ei_masked(mask_enum, i).to(self.device)
+        ea = self.data.ea_masked(mask_enum, i).to(self.device)
+        ew = self.data.ew_masked(mask_enum, i).to(self.device)
+
+        ea = torch.transpose(ea, 0, 1)  # (num_edges, 10)
+        ea_auth = ea[:, :3]    # 계정 종류별 인증 수
+        ea_flows = ea[:, 3:]   # 플로우 통계 7개
+
+        # Auth Encoder
+        x_auth = self.c1(x, ei, edge_weight=ew)
+        x_auth = self.c2(x_auth, ei, edge_weight=ew)
+        x_auth = self.relu(x_auth)
+        x_auth = self.drop(x_auth)
+        x_auth = self.c3(x_auth, ei, edge_weight=ew)
+        x_auth = self.relu(x_auth)
+        x_auth = self.drop(x_auth)
+        auth_emb = self.c4_auth(x_auth, ei, edge_attr=ea_auth)
+        auth_emb = self.ac(auth_emb)
+
+        # Flows Encoder
+        x_flows = self.f1(x, ei, edge_weight=ew)
+        x_flows = self.f2(x_flows, ei, edge_weight=ew)
+        x_flows = self.relu(x_flows)
+        x_flows = self.drop(x_flows)
+        x_flows = self.f3(x_flows, ei, edge_weight=ew)
+        x_flows = self.relu(x_flows)
+        x_flows = self.drop(x_flows)
+        flows_emb = self.c4_flows(x_flows, ei, edge_attr=ea_flows)
+        flows_emb = self.ac(flows_emb)
+
+        fused = torch.cat([auth_emb, flows_emb], dim=1)
+        return self.fusion(fused)
+
+
+# Uni-Flows. 플로우 특징만 사용
+class Argus_LANL_UniFlows(GCN):
+    def __init__(self, data_load, data_kws, h_dim, z_dim, device):
+        super().__init__(data_load, data_kws, h_dim, z_dim, device)
+
+        self.c1 = GCNConv(self.data.x_dim, h_dim, add_self_loops=True)
+        self.relu = nn.ReLU()
+        self.c2 = GCNConv(h_dim, h_dim, add_self_loops=True)
+        self.drop = nn.Dropout(0.1)
+        self.c3 = GCNConv(h_dim, z_dim, add_self_loops=True)
+        self.ac = nn.Tanh()
+
+        flows_nn = nn.Sequential(
+            nn.Linear(7, 8), nn.ReLU(),
+            nn.Linear(8, h_dim * z_dim)
+        )
+        self.c4 = NNConv(h_dim, z_dim, flows_nn, aggr='mean')
+
+    def forward_once(self, mask_enum, i):
+        if self.data.dynamic_feats:
+            x = self.data.xs[i].to(self.device)
+        else:
+            x = self.data.xs.to(self.device)
+
+        ei = self.data.ei_masked(mask_enum, i).to(self.device)
+        ea = self.data.ea_masked(mask_enum, i).to(self.device)
+        ew = self.data.ew_masked(mask_enum, i).to(self.device)
+
+        ea = torch.transpose(ea, 0, 1)
+        ea_flows = ea[:, 3:]
+
+        x = self.c1(x, ei, edge_weight=ew)
+        x = self.c2(x, ei, edge_weight=ew)
+        x = self.relu(x)
+        x = self.drop(x)
+        x = self.c3(x, ei, edge_weight=ew)
+        x = self.relu(x)
+        x = self.drop(x)
+        x = self.c4(x, ei, edge_attr=ea_flows)
+        return self.ac(x)
+
+
+def detector_lanl_rref(loader, kwargs, h_dim, z_dim, **kws):
+    device = kwargs.pop('device')
+    return DetectorEncoder(Argus_LANL(loader, kwargs, h_dim, z_dim, device), device, 'LANL')
+
+
+def detector_lanl_late_rref(loader, kwargs, h_dim, z_dim, **kws):
+    device = kwargs.pop('device')
+    return DetectorEncoder(
+        Argus_LANL_LateFusion(loader, kwargs, h_dim, z_dim, device),
+        device, 'LANL'
+    )
+
+
+def detector_lanl_uniflows_rref(loader, kwargs, h_dim, z_dim, **kws):
+    device = kwargs.pop('device')
+    return DetectorEncoder(
+        Argus_LANL_UniFlows(loader, kwargs, h_dim, z_dim, device),
+        device, 'LANL'
+    )
+
+
+# ---------------------------------------------------------------- CERT r6.2
+
+# CERT용 Late Fusion. 노드 수가 많아 GPU 메모리에 맞게 줄인 구조
+class Argus_CERT(GCN):
+    def __init__(self, data_load, data_kws, h_dim, z_dim, device):
+        super().__init__(data_load, data_kws, h_dim, z_dim, device)
+        self.use_flows = data_kws.get('use_flows', False)
+
+        # 주 그래프 인코더. 노드 특징은 256차원 랜덤 벡터
+        x_dim = 256
+        self.c1 = GCNConv(x_dim, h_dim, add_self_loops=True)
+        self.relu = nn.ReLU()
+        self.c2 = GCNConv(h_dim, h_dim, add_self_loops=True)
+        self.drop = nn.Dropout(0.1)
+        self.c3 = GCNConv(h_dim, z_dim, add_self_loops=True)
+        self.ac = nn.Tanh()
+
+        # 메모리 절약을 위해 NNConv 대신 Linear
+        self.c4_auth = nn.Linear(z_dim, z_dim)
+
+        # 보조 모달리티 인코더
+        self.flows_mlp = nn.Sequential(
+            nn.Linear(7, h_dim), nn.ReLU(),
+            nn.Linear(h_dim, z_dim), nn.Tanh()
+        )
+
+        # 결합 층
+        self.fusion = nn.Sequential(
+            nn.Linear(z_dim * 2, z_dim),
+            nn.Tanh()
+        )
+
+    def forward_once(self, mask_enum, i):
+        if self.data.dynamic_feats:
+            x = self.data.xs[i].to(self.device)
+        else:
+            x = self.data.xs.to(self.device)
+
+        ei = self.data.ei_masked(mask_enum, i).to(self.device)
+        ew = self.data.ew_masked(mask_enum, i).to(self.device)
+
+        x_auth = self.c1(x, ei, edge_weight=ew)
+        x_auth = self.c2(x_auth, ei, edge_weight=ew)
+        x_auth = self.relu(x_auth)
+        x_auth = self.drop(x_auth)
+        x_auth = self.c3(x_auth, ei, edge_weight=ew)
+        x_auth = self.relu(x_auth)
+        x_auth = self.drop(x_auth)
+        auth_emb = self.c4_auth(x_auth)
+        auth_emb = self.ac(auth_emb)
+
+        if not self.use_flows:
+            return auth_emb
+
+        # 엣지 특징을 MLP로 바꾼 뒤 도착 노드별 평균
+        ea = self.data.ea_masked(mask_enum, i)
+        if ea is None:
+            flows_emb = torch.zeros_like(auth_emb)
+        else:
+            ea = ea.to(self.device)
+            ea = torch.transpose(ea, 0, 1).float()
+            if ea.size(0) == ei.size(1):
+                edge_feat = self.flows_mlp(ea)
+                from torch_scatter import scatter_mean
+                flows_emb = scatter_mean(edge_feat, ei[1], dim=0, dim_size=x.size(0))
+            else:
+                flows_emb = torch.zeros_like(auth_emb)
+
+        fused = torch.cat([auth_emb, flows_emb], dim=1)
+        return self.fusion(fused)
+
+
+def detector_cert_rref(loader, kwargs, h_dim, z_dim, **kws):
+    device = kwargs.pop('device')
+    return DetectorEncoder(
+        Argus_CERT(loader, kwargs, h_dim, z_dim, device),
+        device, 'CERT'
+    )
+
+
+# ---------------------------------------------------------------- PicoDomain
+
+# PicoDomain용 MAGNET. 인증(kerberos+ntlm) 횟수 1차원, conn.log 통계 7차원
+class Argus_PicoDomain_LateFusion(GCN):
+    def __init__(self, data_load, data_kws, h_dim, z_dim, device):
+        super().__init__(data_load, data_kws, h_dim, z_dim, device)
+        self.use_flows = data_kws.get('use_flows', False)
+
+        # Auth Encoder
+        self.c1 = GCNConv(self.data.x_dim, h_dim, add_self_loops=True)
+        self.relu = nn.ReLU()
+        self.c2 = GCNConv(h_dim, h_dim, add_self_loops=True)
+        self.drop = nn.Dropout(0.1)
+        self.c3 = GCNConv(h_dim, z_dim, add_self_loops=True)
+        self.ac = nn.Tanh()
+
+        auth_nn = nn.Sequential(
+            nn.Linear(1, 8), nn.ReLU(),
+            nn.Linear(8, h_dim * z_dim)
+        )
+        self.c4_auth = NNConv(h_dim, z_dim, auth_nn, aggr='mean')
+
+        # Flows Encoder
+        self.f1 = GCNConv(self.data.x_dim, h_dim, add_self_loops=True)
+        self.f2 = GCNConv(h_dim, h_dim, add_self_loops=True)
+        self.f3 = GCNConv(h_dim, z_dim, add_self_loops=True)
+
+        flows_nn = nn.Sequential(
+            nn.Linear(7, 8), nn.ReLU(),
+            nn.Linear(8, h_dim * z_dim)
+        )
+        self.c4_flows = NNConv(h_dim, z_dim, flows_nn, aggr='mean')
+
+        # 결합 층
+        self.fusion = nn.Sequential(
+            nn.Linear(z_dim * 2, z_dim),
+            nn.Tanh()
+        )
+
+    def forward_once(self, mask_enum, i):
+        if self.data.dynamic_feats:
+            x = self.data.xs[i].to(self.device)
+        else:
+            x = self.data.xs.to(self.device)
+
+        ei = self.data.ei_masked(mask_enum, i).to(self.device)
+        ew = self.data.ew_masked(mask_enum, i).to(self.device)
+
+        # Auth Encoder
+        x_auth = self.c1(x, ei, edge_weight=ew)
+        x_auth = self.c2(x_auth, ei, edge_weight=ew)
+        x_auth = self.relu(x_auth)
+        x_auth = self.drop(x_auth)
+        x_auth = self.c3(x_auth, ei, edge_weight=ew)
+        x_auth = self.relu(x_auth)
+        x_auth = self.drop(x_auth)
+
+        # 인증 횟수를 1차원 엣지 특징으로 사용
+        ea_auth = ew.unsqueeze(1)
+        auth_emb = self.c4_auth(x_auth, ei, edge_attr=ea_auth)
+        auth_emb = self.ac(auth_emb)
+
+        if not self.use_flows:
+            return auth_emb
+
+        # Flows Encoder
+        ea = self.data.ea_masked(mask_enum, i)
+        if ea is None:
+            flows_emb = torch.zeros_like(auth_emb)
+        else:
+            ea = ea.to(self.device)
+            ea_flows = torch.transpose(ea, 0, 1).float()
+
+            x_flows = self.f1(x, ei, edge_weight=ew)
+            x_flows = self.f2(x_flows, ei, edge_weight=ew)
+            x_flows = self.relu(x_flows)
+            x_flows = self.drop(x_flows)
+            x_flows = self.f3(x_flows, ei, edge_weight=ew)
+            x_flows = self.relu(x_flows)
+            x_flows = self.drop(x_flows)
+
+            if ea_flows.size(0) == ei.size(1):
+                flows_emb = self.c4_flows(x_flows, ei, edge_attr=ea_flows)
+                flows_emb = self.ac(flows_emb)
+            else:
+                flows_emb = torch.zeros_like(auth_emb)
+
+        fused = torch.cat([auth_emb, flows_emb], dim=1)
+        return self.fusion(fused)
+
+
+def detector_pico_late_rref(loader, kwargs, h_dim, z_dim, **kws):
+    device = kwargs.pop('device')
+    return DetectorEncoder(
+        Argus_PicoDomain_LateFusion(loader, kwargs, h_dim, z_dim, device),
+        device, 'PICO'
+    )
+
+
+# ---------------------------------------------------------------- 공통
+
+class DetectorEncoder(Euler_Embed_Unit):
+    def __init__(self, module: Euler_Embed_Unit, device, dataset, **kwargs):
+        super().__init__(**kwargs)
+        self.module = module
+        self.sample_num = 5
+        self.zdim = 16
+        self.out = nn.Sequential(nn.Linear(self.zdim, self.zdim), nn.Softmax(dim=1))
+        if dataset == 'OPTC':
+            self.num_nodes = 815
+            self.ap_loss = APLoss(pos_len=1238452, margin=0.8, gamma=0.1, surrogate_loss='squared', device=device)
+        elif dataset == 'LANL':
+            self.num_nodes = 15611
+            self.ap_loss = APLoss(pos_len=283573, margin=0.8, gamma=0.01, surrogate_loss='squared', device=device)
+        elif dataset == 'CERT':
+            self.num_nodes = 8401
+            self.ap_loss = APLoss(pos_len=4571, margin=0.8, gamma=0.01, surrogate_loss='squared', device=device)
+
+    def train(self, mode=True):
+        self.module.train()
+
+    def load_new_data(self, loader, kwargs):
+        self.module.data = loader(**kwargs)
+        return True
+
+    def get_data_field(self, field):
+        return self.module.data.__getattribute__(field)
+
+    def get_data(self):
+        return self.module.data
+
+    def run_arbitrary_fn(self, fn, *args, **kwargs):
+        return fn(*args, **kwargs)
+
+    def decode(self, e, z, no_grad):
+        src, dst = e
+        return self.module.decode(src, dst, z)
+
+    def inner_forward_sm(self, z, s):
+        temp = torch.matmul(s, z)
+        return self.out(1 / float(self.sample_num) * temp)
+
+    def bce(self, t_scores, f_scores):
+        EPS = 1e-6
+        pos_loss = -torch.log(t_scores+EPS).mean()
+        neg_loss = -torch.log(1-f_scores+EPS).mean()
+        return (pos_loss + neg_loss) * 0.5
+
+    def decode_all(self, zs, unsqueeze=False):
+        assert not zs.size(0) < self.module.data.T, \
+            "%s was given fewer embeddings than it has time slices"
+
+        assert not zs.size(0) > self.module.data.T, \
+            "%s was given more embeddings than it has time slices"
+
+        preds = []
+        ys = []
+        cnts = []
+        for i in range(self.module.data.T):
+            preds_i = self.decode(self.module.data.eis[i], zs[i], False)
+            preds.append(preds_i.detach().cpu().numpy())
+
+            ys.append(self.module.data.ys[i].detach().cpu().numpy())
+            cnts.append(self.module.data.cnt[i].detach().cpu().numpy())
+
+        return preds, ys, cnts
+
+    def score_edges(self, z, partition, nratio):  # for validation
+        n = self.module.data.get_negative_edges(partition, nratio)
+
+        p_scores = []
+        n_scores = []
+
+        for i in range(len(z)):
+            p = self.module.data.ei_masked(partition, i)
+            if p.size(1) == 0:
+                continue
+
+            p_scores.append(self.decode(p, z[i], False))
+            n_scores.append(self.decode(n[i], z[i], False))
+
+        p_scores = torch.cat(p_scores, dim=0)
+        n_scores = torch.cat(n_scores, dim=0)
+
+        return p_scores, n_scores
+
+    # BCE loss (실제 엣지 vs 음성 엣지)
+    def calc_loss(self, z, partition, nratio, device):
+        tot_loss = torch.zeros(1).to(device)
+        ns = self.module.data.get_negative_edges(partition, nratio)
+
+        for i in range(len(z)):
+            ps = self.module.data.ei_masked(partition, i)
+            if ps.size(1) == 0:
+                continue
+            tot_loss += self.bce(
+                self.decode(ps, z[i], False),
+                self.decode(ns[i], z[i], False))
+        return tot_loss.true_divide(len(z))
+
+    # ARGUS 원래 AP loss
+    def calc_loss_argus(self, z, partition, nratio, device):
+        tot_loss = torch.zeros(1).to(device)
+        ns = self.module.data.get_negative_edges(partition, nratio)
+        for i in range(len(z)):
+            ps = self.module.data.ei_masked(partition, i)
+            if ps.size(1) == 0:
+                continue
+            t_index = torch.arange(0, ps.shape[1], dtype=torch.int64).to(device).detach()
+            pos_pred = self.decode(ps, z[i], False)
+            neg_pred = self.decode(ns[i], z[i], False)
+
+            tot_loss += self.ap_loss(
+                torch.cat((pos_pred, neg_pred), 0),
+                torch.cat((torch.ones(pos_pred.shape[0]), torch.zeros(neg_pred.shape[0])), 0).to(self.module.device).detach(),
+                t_index)
+        return tot_loss.true_divide(len(z))
+
+
+class DropEdge(nn.Module):
+    def __init__(self, p):
+        super().__init__()
+        self.p = p
+
+    def forward(self, ei, ewa=None):
+        # ewa: edge weights or edge attributes
+        if self.training and self.p > 0:
+            mask = torch.rand(ei.size(1))
+            if ewa is None:
+                return ei[:, mask > self.p]
+            else:
+                if len(ewa.size()) == 1:
+                    return ei[:, mask > self.p], ewa[mask > self.p]
+                else:
+                    return ei[:, mask > self.p], ewa[:, mask > self.p]
+
+        if ewa is None:
+            return ei
+        else:
+            return ei, ewa
+
+
+class Argus(nn.Module):
+    def __init__(self, rnn: nn.Module, encoder: nn.Module, loss_func, device):
+        super(Argus, self).__init__()
+        self.gcns = encoder
+        self.rnn = rnn
+        self.device = device
+        self.len_from_each = []
+        self.loss_func = loss_func
+
+    def forward(self, mask_enum, include_h=False, h0=None, no_grad=False):
+        futs = self.encode(mask_enum, no_grad)
+        zs = []
+        for f in futs:
+            z, h0 = self.rnn(f.unsqueeze(0).to(self.device), h0, include_h=True)
+            zs.append(z)
+        self.len_from_each = [embed.size(0) for embed in zs]
+        zs = torch.cat(zs, dim=0)
+        self.z_dim = zs.size(-1)
+        if include_h:
+            return zs, h0
+        else:
+            return zs
+
+    def encode(self, mask_enum, no_grad):
+        return self.gcns.module(mask_enum, no_grad)
+
+    def save_states(self):
+        gcn = self.gcns
+        return gcn, deepcopy(self.state_dict())
+
+    def load_states(self, gcn_state_dict, rnn_state_dict):
+        self.load_state_dict(rnn_state_dict)
+
+    def train(self, mode=True):
+        super(Argus, self).train()
+
+    def eval(self):
+        super(Argus, self).train(False)
+
+    def score_all(self, zs, unsqueeze=False):
+        futs = DetectorEncoder.decode_all(self.gcns, zs, unsqueeze)
+
+        obj = [futs]
+        scores, ys, cnts = zip(*obj)
+
+        # Compress into single list of snapshots
+        scores = sum(scores, [])
+        ys = sum(ys, [])
+        cnts = sum(cnts, [])
+
+        return scores, ys, cnts
+
+    def loss_fn(self, zs, partition, nratio=1, device=None, encoder_name=None):
+        if self.loss_func == 'default':
+            if encoder_name == 'ARGUS':
+                futs = DetectorEncoder.calc_loss_argus(self.gcns, zs, partition, nratio, device)
+            else:
+                futs = DetectorEncoder.calc_loss(self.gcns, zs, partition, nratio, device)
+        elif self.loss_func == 'ap':
+            futs = DetectorEncoder.calc_loss_argus(self.gcns, zs, partition, nratio, device)
+        else:
+            futs = DetectorEncoder.calc_loss(self.gcns, zs, partition, nratio, device)
+
+        tot_loss = torch.zeros(1).to(device)
+
+        for f in futs:
+            tot_loss += f
+
+        return tot_loss
+
+    def score_edges(self, zs, partition, nratio=1):
+        futs = DetectorEncoder.score_edges(self.gcns, zs, partition, nratio)
+        pos, neg = zip(*[futs])
+        return torch.cat(pos, dim=0), torch.cat(neg, dim=0)
